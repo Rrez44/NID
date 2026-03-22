@@ -17,13 +17,11 @@ Implements the full cleaning pipeline based on the CICIDS2017 analysis notebook:
 
 import pandas as pd
 import numpy as np
-import os
 import argparse
 import logging
 from pathlib import Path
-import sys
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+import common  # noqa: F401 - ensures project root on path
 import config
 
 logging.basicConfig(
@@ -164,7 +162,7 @@ def preprocess_csv(input_csv, output_csv, corr_threshold=0.95, min_class_count=1
     """
     logger.info(f"Starting preprocessing: {input_csv}")
 
-    if not os.path.exists(input_csv):
+    if not Path(input_csv).exists():
         raise FileNotFoundError(f"Input file not found: {input_csv}")
 
     # ── Load ──────────────────────────────────────────────────────────────────

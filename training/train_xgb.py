@@ -12,20 +12,16 @@ import xgboost as xgb
 from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
 from sklearn.metrics import (
     classification_report, confusion_matrix, roc_auc_score,
-    roc_curve, precision_recall_curve, accuracy_score,
-    precision_score, recall_score, f1_score
+    roc_curve, accuracy_score, precision_score, recall_score, f1_score
 )
 from sklearn.preprocessing import LabelEncoder
 import joblib
-import os
 import argparse
 import logging
 import numpy as np
 from pathlib import Path
-import sys
 
-# Add project root to path to import config
-sys.path.insert(0, str(Path(__file__).parent.parent))
+import common  # noqa: F401 - ensures project root on path
 import config
 
 # Setup logging
@@ -163,7 +159,7 @@ def evaluate_model(y_true, y_pred, y_pred_proba=None, save_plots=False, output_d
             logger.warning("matplotlib not available, skipping plot generation")
             return metrics
         
-        os.makedirs(output_dir, exist_ok=True)
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
         
         # Confusion matrix plot (works for binary and multiclass)
         plt.figure(figsize=(8, 6))
@@ -189,7 +185,7 @@ def evaluate_model(y_true, y_pred, y_pred_proba=None, save_plots=False, output_d
                     color="white" if cm[i, j] > thresh else "black")
         
         plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'confusion_matrix.png'))
+        plt.savefig(Path(output_dir) / 'confusion_matrix.png')
         plt.close()
         logger.info(f"Confusion matrix plot saved to {output_dir}")
         
@@ -208,7 +204,7 @@ def evaluate_model(y_true, y_pred, y_pred_proba=None, save_plots=False, output_d
             plt.title('ROC Curve')
             plt.legend(loc="lower right")
             plt.tight_layout()
-            plt.savefig(os.path.join(output_dir, 'roc_curve.png'))
+            plt.savefig(Path(output_dir) / 'roc_curve.png')
             plt.close()
             logger.info(f"ROC curve plot saved to {output_dir}")
     
@@ -235,8 +231,7 @@ def train_xgb(preprocessed_csv, model_path, tune_hyperparameters=False, save_plo
     """
     logger.info(f"Starting training with data from {preprocessed_csv}")
     
-    # Validate input file
-    if not os.path.exists(preprocessed_csv):
+    if not Path(preprocessed_csv).exists():
         raise FileNotFoundError(f"Preprocessed CSV not found: {preprocessed_csv}")
     
     # Load cleaned data
@@ -456,9 +451,8 @@ def train_xgb(preprocessed_csv, model_path, tune_hyperparameters=False, save_plo
     logger.info("\nTop 10 Most Important Features:")
     logger.info(f"\n{feature_importance.head(10).to_string(index=False)}")
     
-    # Save trained model
+    Path(model_path).parent.mkdir(parents=True, exist_ok=True)
     logger.info(f"Saving model to {model_path}")
-    os.makedirs(os.path.dirname(model_path), exist_ok=True)
     joblib.dump(model, model_path)
     
     # Save label mapping (index -> class label for multiclass)
@@ -466,7 +460,12 @@ def train_xgb(preprocessed_csv, model_path, tune_hyperparameters=False, save_plo
     label_mapping_path = model_path.replace('.pkl', '_label_mapping.pkl')
     joblib.dump(label_mapping, label_mapping_path)
     logger.info(f"Label mapping saved to {label_mapping_path}")
-    
+
+    # Save expected feature names for inference alignment
+    feature_names_path = model_path.replace('.pkl', '_feature_names.pkl')
+    joblib.dump(list(X.columns), feature_names_path)
+    logger.info(f"Feature names saved to {feature_names_path}")
+
     # Save feature importance
     importance_path = model_path.replace('.pkl', '_feature_importance.csv')
     feature_importance.to_csv(importance_path, index=False)

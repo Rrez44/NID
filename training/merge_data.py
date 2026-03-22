@@ -6,27 +6,12 @@ consolidated CSV file for preprocessing and training.
 """
 
 import pandas as pd
-import os
 import argparse
 import logging
 from pathlib import Path
-import sys
 
-# Add project root to path to import config
-_project_root = Path(__file__).parent.parent
-_default_input_dir = _project_root / "data" / "raw" / "MachineLearningCVE"
-_default_output = _project_root / "data" / "merged" / "MachineLearningCSV_merged.csv"
-
-if str(_project_root) not in sys.path:
-    sys.path.insert(0, str(_project_root))
-
-try:
-    import config
-    _default_input_dir = config.MACHINE_LEARNING_CVE_DIR
-    _default_output = config.MERGED_CSV
-except (ImportError, AttributeError):
-    # Fallback to relative paths if config can't be imported
-    pass
+import common  # noqa: F401 - ensures project root on path
+import config
 
 # Setup logging
 logging.basicConfig(
@@ -49,8 +34,7 @@ def merge_csv_files(input_dir, output_csv):
     """
     logger.info(f"Starting merge process from {input_dir}")
     
-    # Check if input directory exists
-    if not os.path.exists(input_dir):
+    if not Path(input_dir).exists():
         raise FileNotFoundError(f"Input directory not found: {input_dir}")
     
     # Find all CSV files
@@ -115,13 +99,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--input-dir",
         type=str,
-        default=str(_default_input_dir),
+        default=str(config.MACHINE_LEARNING_CVE_DIR),
         help="Directory containing CSV files to merge"
     )
     parser.add_argument(
         "--output",
         type=str,
-        default=str(_default_output),
+        default=str(config.MERGED_CSV),
         help="Path to output merged CSV file"
     )
     

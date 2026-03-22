@@ -9,12 +9,9 @@ import numpy as np
 import joblib
 import argparse
 import logging
-import os
 from pathlib import Path
-import sys
 
-# Add project root to path to import config
-sys.path.insert(0, str(Path(__file__).parent.parent))
+import common  # noqa: F401 - ensures project root on path
 import config
 
 # Setup logging
@@ -27,23 +24,21 @@ logger = logging.getLogger(__name__)
 
 def load_model(model_path):
     """
-    Load trained model and label mapping.
-    
-    Args:
-        model_path (str): Path to saved model file
-        
+    Load trained model, label mapping, and expected feature names.
+
     Returns:
-        tuple: (model, label_mapping)
+        tuple: (model, reverse_mapping, feature_names or None)
     """
-    if not os.path.exists(model_path):
+    path = Path(model_path)
+    if not path.exists():
         raise FileNotFoundError(f"Model file not found: {model_path}")
     
     logger.info(f"Loading model from {model_path}")
     model = joblib.load(model_path)
     
-    # Try to load label mapping
-    label_mapping_path = model_path.replace('.pkl', '_label_mapping.pkl')
-    if os.path.exists(label_mapping_path):
+    label_mapping_path = path.with_name(path.stem + '_label_mapping.pkl')
+    feature_names_path = path.with_name(path.stem + '_feature_names.pkl')
+    if label_mapping_path.exists():
         mapping = joblib.load(label_mapping_path)
         # Support both old (str->int) and new (int->label or list) formats
         if isinstance(mapping, dict):
@@ -61,40 +56,42 @@ def load_model(model_path):
     else:
         logger.warning("Label mapping file not found, using default mapping")
         reverse_mapping = {0: 'BENIGN', 1: 'ATTACK'}
-    
-    return model, reverse_mapping
+
+    feature_names = None
+    if feature_names_path.exists():
+        feature_names = joblib.load(feature_names_path)
+        logger.info(f"Loaded expected feature list ({len(feature_names)} features)")
+
+    return model, reverse_mapping, feature_names
 
 
-def preprocess_input(df, drop_cols=None):
+def preprocess_input(df, feature_names=None, drop_cols=None):
     """
-    Preprocess input data to match training data format.
-    
+    Preprocess input to match training format.
+    Input should be the cleaned CSV (output of preprocess.py) or have the same feature columns.
+
     Args:
-        df (pd.DataFrame): Input dataframe
-        drop_cols (list, optional): Columns to drop
-        
-    Returns:
-        pd.DataFrame: Preprocessed dataframe
+        df: Input dataframe
+        feature_names: Expected feature list (from model). If provided, X is aligned to this order.
+        drop_cols: Extra columns to drop (identifiers, labels). Default: Flow ID, Src IP, Dst IP, Timestamp.
     """
     if drop_cols is None:
         drop_cols = ['Flow ID', 'Src IP', 'Dst IP', 'Timestamp']
-    
-    # Make a copy to avoid modifying original
     df = df.copy()
-    
-    # Strip whitespace from column names
     df.columns = df.columns.str.strip()
-    
-    # Drop non-generalizable columns if they exist
-    existing_drop_cols = [c for c in drop_cols if c in df.columns]
-    if existing_drop_cols:
-        logger.info(f"Dropping columns: {existing_drop_cols}")
-        df = df.drop(columns=existing_drop_cols)
-    
-    # Handle infinities and NaN values
+    existing = [c for c in drop_cols if c in df.columns]
+    if existing:
+        df = df.drop(columns=existing)
+    for c in ('Label', 'Source_File', 'Attack Type'):
+        if c in df.columns:
+            df = df.drop(columns=[c])
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
     df.fillna(0, inplace=True)
-    
+    if feature_names is not None:
+        missing = set(feature_names) - set(df.columns)
+        if missing:
+            raise ValueError(f"Input missing required features: {list(missing)}")
+        df = df[feature_names]
     return df
 
 
@@ -127,25 +124,13 @@ def predict(model, X, reverse_mapping, return_proba=False):
 def run_inference(input_csv, model_path, output_csv=None):
     """
     Run inference on a CSV file.
-    
-    Args:
-        input_csv (str): Path to input CSV file
-        model_path (str): Path to trained model
-        output_csv (str, optional): Path to save predictions
+    Input CSV should be in cleaned format (output of preprocess.py) with same features as training.
     """
     logger.info(f"Starting inference on {input_csv}")
-    
-    # Load model
-    model, reverse_mapping = load_model(model_path)
-    
-    # Load input data
-    logger.info(f"Loading input data from {input_csv}")
+    model, reverse_mapping, feature_names = load_model(model_path)
     df = pd.read_csv(input_csv)
     logger.info(f"Loaded {len(df)} samples with {len(df.columns)} columns")
-    
-    # Preprocess input data
-    logger.info("Preprocessing input data...")
-    X = preprocess_input(df)
+    X = preprocess_input(df, feature_names=feature_names)
     
     # Check if we have the expected features
     # Note: In a production system, you'd want to ensure feature alignment
@@ -168,12 +153,11 @@ def run_inference(input_csv, model_path, output_csv=None):
     logger.info(f"\nPrediction Summary:")
     logger.info(f"{prediction_counts}")
     
-    # Save results if output path provided
     if output_csv:
-        logger.info(f"Saving predictions to {output_csv}")
-        os.makedirs(os.path.dirname(output_csv), exist_ok=True)
+        out = Path(output_csv)
+        out.parent.mkdir(parents=True, exist_ok=True)
         df.to_csv(output_csv, index=False)
-        logger.info(f"Predictions saved successfully!")
+        logger.info(f"Predictions saved to {output_csv}")
     else:
         # Print first few predictions (prediction + top-1 probability)
         logger.info("\nFirst 10 predictions:")

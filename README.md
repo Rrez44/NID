@@ -1,10 +1,10 @@
 # Intrusion Detection System (IDS) - Thesis Project
 
-A machine learning-based Intrusion Detection System using XGBoost to classify network traffic as BENIGN or ATTACK.
+A machine learning-based Intrusion Detection System using XGBoost to classify network traffic by attack type (multiclass).
 
 ## Project Overview
 
-This project implements an IDS that uses the CICIDS2017 dataset to train an XGBoost classifier for binary classification of network traffic. The system processes network flow features and predicts whether traffic is benign or malicious.
+This project implements an IDS that uses the CICIDS2017 dataset to train an XGBoost classifier for **multiclass** classification: Normal Traffic, DoS, DDoS, Port Scanning, Brute Force, Web Attacks, and Bot. The system includes a full preprocessing pipeline (deduplication, feature selection, attack grouping) and multiple train/test split strategies to avoid session leakage.
 
 ## Project Structure
 
@@ -83,39 +83,31 @@ python training/merge_data.py \
 Clean and preprocess the merged data:
 
 ```bash
+python training/preprocess.py
+# Or with custom paths:
 python training/preprocess.py \
     --input data/merged/MachineLearningCSV_merged.csv \
     --output data/merged/MachineLearningCSV_cleaned.csv
 ```
 
-This step:
-- Removes non-generalizable columns (IPs, Flow IDs, Timestamps)
-- Handles missing values and infinities
-- Converts labels to binary format (BENIGN/ATTACK)
+This step: removes duplicates, identical columns, infinities/NaNs, zero-variance features; groups 15 attack labels into 7 semantic categories; drops highly correlated and statistically irrelevant features.
 
 ### 3. Train Model
 
 Train the XGBoost classifier:
 
 ```bash
-# Basic training with default hyperparameters
-python training/train_xgb.py \
-    --input data/merged/MachineLearningCSV_cleaned.csv \
-    --model models/xgb_ids_model.pkl
+# Per-file split (70/30 within each capture) — all attack types in test set
+python training/train_xgb.py --split-strategy per_file
 
-# With hyperparameter tuning (slower but may improve performance)
-python training/train_xgb.py \
-    --input data/merged/MachineLearningCSV_cleaned.csv \
-    --model models/xgb_ids_model.pkl \
-    --tune
+# File-holdout split (realistic, whole files held out)
+python training/train_xgb.py --split-strategy file_holdout
 
-# With evaluation plots
-python training/train_xgb.py \
-    --input data/merged/MachineLearningCSV_cleaned.csv \
-    --model models/xgb_ids_model.pkl \
-    --save-plots \
-    --output-dir models/
+# With hyperparameter tuning
+python training/train_xgb.py --split-strategy per_file --tune
 ```
+
+Split strategies: `per_file` (default for per-attack metrics), `file_holdout`, `temporal`, `file`, `random`.
 
 ### 4. Run Inference
 
@@ -144,9 +136,8 @@ The training script provides comprehensive evaluation:
 
 ### Input Data Requirements
 
-The input CSV files should contain network flow features. The preprocessing script expects:
-- A `Label` column with values that can be converted to BENIGN/ATTACK
-- Network flow features (statistical, timing, protocol features, etc.)
+- Raw CSVs: CICIDS2017 format with `Label` column
+- Inference: Use the **cleaned CSV** (output of preprocess.py) so feature columns match the trained model
 
 ### Columns Removed During Preprocessing
 
@@ -204,7 +195,7 @@ The scripts include data validation that will raise errors if:
 ## Future Improvements
 
 Potential enhancements:
-- Support for multi-class classification (specific attack types)
+- Class weights / SMOTE for minority classes (Bot, Web Attacks)
 - Real-time inference API
 - Model versioning and experiment tracking
 - Additional ML models (Random Forest, Neural Networks)
