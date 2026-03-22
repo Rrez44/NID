@@ -204,19 +204,15 @@ Potential enhancements:
 
 ## License
 
-[Add your license here]
+https://github.com/Rrez44/NID/blob/main/LICENSE
 
 ## Author
 
-[Add your name/institution here]
+Rrezon Beqiri, University Of Prishtin
 
 ## Citation
 
-If you use this code in your research, please cite:
-
-```
-[Add citation information]
-```
+If you use this code in your research, please cite!
 
 ## Acknowledgments
 
