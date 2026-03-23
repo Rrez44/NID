@@ -4,203 +4,220 @@ A machine learning-based Intrusion Detection System using XGBoost to classify ne
 
 ## Project Overview
 
-This project implements an IDS that uses the CICIDS2017 dataset to train an XGBoost classifier for **multiclass** classification: Normal Traffic, DoS, DDoS, Port Scanning, Brute Force, Web Attacks, and Bot. The system includes a full preprocessing pipeline (deduplication, feature selection, attack grouping) and multiple train/test split strategies to avoid session leakage.
+This project implements an IDS that uses the CICIDS2017 dataset to train an XGBoost classifier for **multiclass** classification: Normal Traffic, DoS, DDoS, Port Scanning, Brute Force, Web Attacks, and Bot. The system includes a leak-safe preprocessing pipeline (deduplication, feature selection fit on training data only, attack grouping) and multiple train/test split strategies to avoid session leakage.
 
 ## Project Structure
 
 ```
 ids-thesis/
-├── config.py                   # Configuration file (auto-detects project root)
-├── data/
-│   ├── raw/                    # Raw dataset files
-│   │   ├── MachineLearningCSV.zip
-│   │   └── MachineLearningCVE/ # Individual CSV files
-│   └── merged/                  # Processed data
-│       ├── MachineLearningCSV_merged.csv
-│       └── MachineLearningCSV_cleaned.csv
-├── training/                    # Training scripts
-│   ├── merge_data.py           # Merge multiple CSV files
-│   ├── preprocess.py           # Data preprocessing
-│   ├── train_xgb.py            # Model training
-│   └── inference.py            # Model inference
-├── models/                      # Trained models and outputs
+├── config.py                       # Path configuration (auto-detects project root)
+├── Makefile                        # Pipeline automation (make all, make train, etc.)
+├── requirements.txt                # Python dependencies
+├── training/
+│   ├── common.py                   # sys.path setup for imports
+│   ├── merge_data.py               # Merge multiple CSV files
+│   ├── preprocess.py               # Leak-safe data preprocessing
+│   ├── feature_selection.py        # Post-split feature selector (fit on train only)
+│   ├── train_xgb.py                # Model training (XGBoost / Random Forest)
+│   └── inference.py                # Batch inference
+├── api/
+│   ├── __init__.py
+│   └── serve.py                    # FastAPI inference endpoint
+├── models/                         # Trained models and artifacts
 │   ├── xgb_ids_model.pkl
 │   ├── xgb_ids_model_label_mapping.pkl
-│   └── xgb_ids_model_feature_importance.csv
-├── requirements.txt            # Python dependencies
-└── README.md                   # This file
+│   ├── xgb_ids_model_feature_names.pkl
+│   ├── xgb_ids_model_feature_selector.pkl
+│   ├── xgb_ids_model_feature_importance.csv
+│   └── experiment_*.json           # Experiment logs
+├── data/
+│   ├── raw/                        # Raw dataset files
+│   │   ├── MachineLearningCSV.zip
+│   │   └── MachineLearningCVE/     # Individual CSV files
+│   └── merged/                     # Processed data
+│       ├── MachineLearningCSV_merged.csv
+│       └── MachineLearningCSV_cleaned.csv
+├── README.md
+└── LICENSE
 ```
 
-## Configuration
+## Key Design Decisions
 
-The project uses a `config.py` file that automatically detects the project root directory and provides relative paths for all data and model files. This makes the project portable - you can move it to any location and it will work without modifying any paths.
+### No Data Leakage
+Feature selection (zero-variance removal, correlation filtering, irrelevant-feature removal) is performed **after** the train/test split, fitted on training data only. This is handled by `FeatureSelector` in `training/feature_selection.py`. The preprocessing script (`preprocess.py`) only applies structural transforms that don't depend on data statistics.
 
-All scripts use relative paths by default, but you can still override them using command-line arguments if needed.
+### Class Imbalance Handling
+Inverse-frequency sample weights (`sklearn.utils.class_weight.compute_sample_weight('balanced')`) are applied during training so minority classes (Bot, Web Attacks) contribute proportionally to the loss.
 
-## Features
-
-- **Data Processing Pipeline**: Automated merging and preprocessing of network traffic data
-- **XGBoost Classifier**: High-performance gradient boosting model
-- **Comprehensive Evaluation**: Multiple metrics including accuracy, precision, recall, F1-score, ROC-AUC
-- **Hyperparameter Tuning**: Optional randomized search for optimal parameters
-- **Feature Importance Analysis**: Identifies most important features for classification
-- **Model Persistence**: Save and load trained models for inference
-- **Visualization**: Confusion matrix and ROC curve plots
+### Session Leakage Prevention
+GroupKFold cross-validation uses `Source_File` as the group key, ensuring no flows from the same capture file appear in both train and validation folds.
 
 ## Installation
 
-1. Clone the repository:
 ```bash
 git clone <repository-url>
 cd ids-thesis
-```
-
-2. Create a virtual environment (recommended):
-```bash
 python3 -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-```
-
-3. Install dependencies:
-```bash
+source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Usage
+## Quick Start (Makefile)
+
+```bash
+make all           # Full pipeline: merge → preprocess → train
+make train-rf      # Random Forest baseline
+make train-tune    # XGBoost with Optuna hyperparameter tuning
+make train-ablation # XGBoost without Destination Port (ablation study)
+make shap          # Train + SHAP interpretability analysis
+make serve         # Start FastAPI inference server on port 8000
+make help          # Show all available targets
+```
+
+## Usage (Manual)
 
 ### 1. Merge Raw Data Files
 
-If you have multiple CSV files in the raw data directory, merge them first:
-
 ```bash
-python training/merge_data.py \
+python3 training/merge_data.py \
     --input-dir data/raw/MachineLearningCVE \
     --output data/merged/MachineLearningCSV_merged.csv
 ```
 
 ### 2. Preprocess Data
 
-Clean and preprocess the merged data:
-
 ```bash
-python training/preprocess.py
-# Or with custom paths:
-python training/preprocess.py \
-    --input data/merged/MachineLearningCSV_merged.csv \
-    --output data/merged/MachineLearningCSV_cleaned.csv
+python3 training/preprocess.py
 ```
 
-This step: removes duplicates, identical columns, infinities/NaNs, zero-variance features; groups 15 attack labels into 7 semantic categories; drops highly correlated and statistically irrelevant features.
+This step: removes identifiers (IP, Flow ID, Timestamp), deduplicates rows and columns, handles infinities/NaN, groups 15 attack labels into 7 semantic categories, drops rare classes (Infiltration, Heartbleed).
+
+**Note:** Zero-variance, correlation, and irrelevant-feature removal are now handled post-split inside the training script to prevent data leakage.
 
 ### 3. Train Model
 
-Train the XGBoost classifier:
-
 ```bash
-# Per-file split (70/30 within each capture) — all attack types in test set
-python training/train_xgb.py --split-strategy per_file
+# XGBoost with file-holdout split (default, recommended)
+python3 training/train_xgb.py --split-strategy file_holdout --save-plots
 
-# File-holdout split (realistic, whole files held out)
-python training/train_xgb.py --split-strategy file_holdout
+# Random Forest baseline for comparison
+python3 training/train_xgb.py --model-type rf --model models/rf_ids_model.pkl
 
-# With hyperparameter tuning
-python training/train_xgb.py --split-strategy per_file --tune
+# With Optuna hyperparameter tuning (50 trials)
+python3 training/train_xgb.py --tune --tune-method optuna
+
+# With legacy RandomizedSearchCV tuning
+python3 training/train_xgb.py --tune --tune-method random
+
+# Destination Port ablation study
+python3 training/train_xgb.py --drop-port --model models/xgb_no_port.pkl
+
+# SHAP interpretability analysis
+python3 training/train_xgb.py --shap --save-plots
+
+# Disable class weights (for comparison)
+python3 training/train_xgb.py --no-class-weights
 ```
 
-Split strategies: `per_file` (default for per-attack metrics), `file_holdout`, `temporal`, `file`, `random`.
+**Split strategies:** `file_holdout` (default), `per_file`, `temporal`, `file`, `random`.
 
 ### 4. Run Inference
 
-Make predictions on new data:
-
 ```bash
-python training/inference.py \
+python3 training/inference.py \
     --input data/test_data.csv \
     --model models/xgb_ids_model.pkl \
     --output predictions.csv
 ```
 
-## Model Evaluation Metrics
+### 5. API Server
 
-The training script provides comprehensive evaluation:
+```bash
+uvicorn api.serve:app --host 0.0.0.0 --port 8000 --reload
+```
 
-- **Accuracy**: Overall classification accuracy
-- **Precision**: True positives / (True positives + False positives)
-- **Recall**: True positives / (True positives + False negatives)
-- **F1-Score**: Harmonic mean of precision and recall
-- **ROC-AUC**: Area under the ROC curve
-- **Confusion Matrix**: Detailed breakdown of predictions
-- **Feature Importance**: Top features contributing to classification
+Endpoints:
+- `POST /predict` — classify a single flow (pass features as JSON)
+- `GET /health` — liveness check
+- `GET /classes` — list known attack classes
 
-## Data Format
+Example:
+```bash
+curl -X POST http://localhost:8000/predict \
+  -H "Content-Type: application/json" \
+  -d '{"features": {"Destination Port": 80, "Flow Duration": 1234, ...}}'
+```
 
-### Input Data Requirements
+## Evaluation Metrics
 
-- Raw CSVs: CICIDS2017 format with `Label` column
-- Inference: Use the **cleaned CSV** (output of preprocess.py) so feature columns match the trained model
+The training script reports both **weighted** and **macro** averaged metrics:
 
-### Columns Removed During Preprocessing
+| Metric | Averaging | Purpose |
+|--------|-----------|---------|
+| Accuracy | — | Overall correctness |
+| Precision | weighted + macro | False positive control |
+| Recall | weighted + macro | False negative control |
+| F1-Score | weighted + macro | Balanced measure |
+| ROC-AUC | macro (OvR) | Ranking quality |
 
-The following columns are automatically removed as they are not generalizable:
-- `Flow ID`
-- `Src IP`
-- `Dst IP`
-- `Timestamp`
+Per-class precision/recall/F1/support is logged and saved in the experiment JSON.
 
-## Model Architecture
+## Output Artifacts
 
-- **Algorithm**: XGBoost (Extreme Gradient Boosting)
-- **Default Hyperparameters**:
-  - `max_depth`: 6
-  - `n_estimators`: 100
-  - `learning_rate`: 0.1
-  - `eval_metric`: logloss
+After training, the following files are generated in `models/`:
 
-Hyperparameter tuning can be enabled with the `--tune` flag.
+| File | Description |
+|------|-------------|
+| `xgb_ids_model.pkl` | Trained model (joblib serialised) |
+| `*_label_mapping.pkl` | Index → class-name mapping |
+| `*_feature_names.pkl` | Ordered feature list (for inference alignment) |
+| `*_feature_selector.pkl` | Fitted FeatureSelector (documents what was dropped) |
+| `*_feature_importance.csv` | Feature importance scores |
+| `experiment_*.json` | Full experiment record (params, metrics, data hash) |
+| `confusion_matrix.png` | Confusion matrix plot (if `--save-plots`) |
+| `shap_summary_bar.png` | SHAP bar summary (if `--shap`) |
+| `shap_beeswarm_*.png` | Per-class SHAP beeswarm (if `--shap`) |
+| `shap_values.csv` | Mean |SHAP| per feature per class (if `--shap`) |
 
-## Output Files
+## Experiment Log Schema
 
-After training, the following files are generated:
+Each training run writes a JSON file:
 
-- `xgb_ids_model.pkl`: Trained model (serialized)
-- `xgb_ids_model_label_mapping.pkl`: Label encoding mapping
-- `xgb_ids_model_feature_importance.csv`: Feature importance scores
-- `confusion_matrix.png`: Confusion matrix visualization (if `--save-plots` used)
-- `roc_curve.png`: ROC curve visualization (if `--save-plots` used)
-
-## Troubleshooting
-
-### Common Issues
-
-1. **FileNotFoundError**: Ensure data files exist in the specified paths
-2. **Memory Error**: Dataset may be too large - consider sampling or using a machine with more RAM
-3. **Label Column Missing**: Ensure your CSV has a 'Label' column
-4. **Import Errors**: Make sure all dependencies are installed: `pip install -r requirements.txt`
-
-### Data Validation
-
-The scripts include data validation that will raise errors if:
-- Input files don't exist
-- Required columns are missing
-- Data is empty
-- Labels are invalid
-
-## Performance Tips
-
-1. **Hyperparameter Tuning**: Use `--tune` for better performance (takes longer)
-2. **GPU Acceleration**: Install CUDA-enabled XGBoost for faster training
-3. **Data Sampling**: For very large datasets, consider sampling for faster iteration
-4. **Cross-Validation**: The training script includes 5-fold CV for robust evaluation
-
-## Future Improvements
-
-Potential enhancements:
-- Class weights / SMOTE for minority classes (Bot, Web Attacks)
-- Real-time inference API
-- Model versioning and experiment tracking
-- Additional ML models (Random Forest, Neural Networks)
-- Feature engineering and selection
-- Handling class imbalance with SMOTE or class weights
+```json
+{
+  "timestamp": "2026-03-23T12:00:00+00:00",
+  "model_type": "xgb",
+  "params": {"max_depth": 6, "n_estimators": 100, "...": "..."},
+  "split_strategy": "file_holdout",
+  "tune_method": null,
+  "n_train": 1800000,
+  "n_test": 600000,
+  "classes": ["Bot", "Brute Force", "DDoS", "DoS", "Normal Traffic", "Port Scanning", "Web Attacks"],
+  "metrics": {
+    "accuracy": 0.9876,
+    "f1_weighted": 0.9870,
+    "f1_macro": 0.9234,
+    "precision_macro": 0.9345,
+    "recall_macro": 0.9123,
+    "roc_auc_macro": 0.9876,
+    "per_class": {
+      "Normal Traffic": {"precision": 0.99, "recall": 0.99, "f1": 0.99, "support": 480000},
+      "Bot": {"precision": 0.85, "recall": 0.78, "f1": 0.81, "support": 1200}
+    }
+  },
+  "cv_f1_macro": 0.9200,
+  "feature_selection": {
+    "corr_threshold": 0.95,
+    "n_features_out": 40,
+    "n_correlated": 5,
+    "n_zero_var": 2,
+    "n_irrelevant": 8
+  },
+  "dataset_hash": "a1b2c3d4e5f6g7h8",
+  "class_weights": true,
+  "drop_port": false
+}
+```
 
 ## License
 
@@ -210,11 +227,16 @@ https://github.com/Rrez44/NID/blob/main/LICENSE
 
 Rrezon Beqiri, University Of Prishtin
 
+<<<<<<< HEAD
 ## Citation
 
 If you use this code in your research, please cite!
 
+=======
+>>>>>>> 1919e15 (Restructured architecture and processing)
 ## Acknowledgments
 
 - CICIDS2017 Dataset: https://www.unb.ca/cic/datasets/ids-2017.html
 - XGBoost: https://xgboost.readthedocs.io/
+- SHAP: https://shap.readthedocs.io/
+- Optuna: https://optuna.readthedocs.io/

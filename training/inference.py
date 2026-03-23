@@ -1,7 +1,9 @@
 """
 Inference script for IDS thesis project.
 
-This script loads a trained XGBoost model and makes predictions on new data.
+Loads a trained model and its companion artifacts (label mapping, feature names)
+and makes predictions on new data.  Input should be a cleaned CSV produced by
+preprocess.py (or any CSV with matching feature columns).
 """
 
 import pandas as pd
@@ -14,7 +16,6 @@ from pathlib import Path
 import common  # noqa: F401 - ensures project root on path
 import config
 
-# Setup logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -22,58 +23,61 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _artifact_path(model_path, suffix):
+    """Derive companion artifact path from the model path using Path operations."""
+    p = Path(model_path)
+    return p.with_name(f'{p.stem}{suffix}')
+
+
 def load_model(model_path):
     """
     Load trained model, label mapping, and expected feature names.
 
     Returns:
-        tuple: (model, reverse_mapping, feature_names or None)
+        tuple: (model, reverse_mapping dict, feature_names list or None)
     """
     path = Path(model_path)
     if not path.exists():
         raise FileNotFoundError(f"Model file not found: {model_path}")
-    
-    logger.info(f"Loading model from {model_path}")
+
+    logger.info("Loading model from %s", model_path)
     model = joblib.load(model_path)
-    
-    label_mapping_path = path.with_name(path.stem + '_label_mapping.pkl')
-    feature_names_path = path.with_name(path.stem + '_feature_names.pkl')
-    if label_mapping_path.exists():
-        mapping = joblib.load(label_mapping_path)
-        # Support both old (str->int) and new (int->label or list) formats
+
+    # Label mapping
+    lm_path = _artifact_path(model_path, '_label_mapping.pkl')
+    if lm_path.exists():
+        mapping = joblib.load(lm_path)
         if isinstance(mapping, dict):
-            # If keys are strings, assume {label: index} and invert
             if all(isinstance(k, str) for k in mapping.keys()):
                 reverse_mapping = {v: k for k, v in mapping.items()}
             else:
-                # Assume {index: label}
                 reverse_mapping = mapping
         elif isinstance(mapping, (list, tuple, np.ndarray)):
             reverse_mapping = {idx: lbl for idx, lbl in enumerate(mapping)}
         else:
-            logger.warning("Unrecognized label mapping format, falling back to binary default")
+            logger.warning("Unrecognized label mapping format – using binary default")
             reverse_mapping = {0: 'BENIGN', 1: 'ATTACK'}
     else:
-        logger.warning("Label mapping file not found, using default mapping")
+        logger.warning("Label mapping not found at %s – using binary default", lm_path)
         reverse_mapping = {0: 'BENIGN', 1: 'ATTACK'}
 
+    # Feature names
+    fn_path = _artifact_path(model_path, '_feature_names.pkl')
     feature_names = None
-    if feature_names_path.exists():
-        feature_names = joblib.load(feature_names_path)
-        logger.info(f"Loaded expected feature list ({len(feature_names)} features)")
+    if fn_path.exists():
+        feature_names = joblib.load(fn_path)
+        logger.info("Loaded expected feature list (%d features)", len(feature_names))
 
     return model, reverse_mapping, feature_names
 
 
 def preprocess_input(df, feature_names=None, drop_cols=None):
     """
-    Preprocess input to match training format.
-    Input should be the cleaned CSV (output of preprocess.py) or have the same feature columns.
+    Align input DataFrame to the feature set expected by the model.
 
-    Args:
-        df: Input dataframe
-        feature_names: Expected feature list (from model). If provided, X is aligned to this order.
-        drop_cols: Extra columns to drop (identifiers, labels). Default: Flow ID, Src IP, Dst IP, Timestamp.
+    The saved ``feature_names`` already reflect post-split feature selection,
+    so applying them during inference achieves the same column subsetting that
+    was used during training – no separate FeatureSelector load required.
     """
     if drop_cols is None:
         drop_cols = ['Flow ID', 'Src IP', 'Dst IP', 'Timestamp']
@@ -90,111 +94,71 @@ def preprocess_input(df, feature_names=None, drop_cols=None):
     if feature_names is not None:
         missing = set(feature_names) - set(df.columns)
         if missing:
-            raise ValueError(f"Input missing required features: {list(missing)}")
+            raise ValueError(f"Input missing required features: {sorted(missing)}")
         df = df[feature_names]
     return df
 
 
 def predict(model, X, reverse_mapping, return_proba=False):
-    """
-    Make predictions using the trained model.
-    
-    Args:
-        model: Trained XGBoost model
-        X (pd.DataFrame): Feature matrix
-        reverse_mapping (dict): Mapping from numeric labels to string labels
-        return_proba (bool): Whether to return prediction probabilities
-        
-    Returns:
-        array or tuple: Predictions (and probabilities if return_proba=True)
-    """
-    logger.info(f"Making predictions on {len(X)} samples...")
-    
-    # Get predictions
+    """Make predictions and optionally return class probabilities."""
+    logger.info("Predicting on %d samples...", len(X))
     y_pred_numeric = model.predict(X)
-    y_pred = np.array([reverse_mapping[label] for label in y_pred_numeric])
-    
+    y_pred = np.array([reverse_mapping[int(label)] for label in y_pred_numeric])
+
     if return_proba:
-        y_proba = model.predict_proba(X)
-        return y_pred, y_proba
-    else:
-        return y_pred
+        return y_pred, model.predict_proba(X)
+    return y_pred
 
 
 def run_inference(input_csv, model_path, output_csv=None):
-    """
-    Run inference on a CSV file.
-    Input CSV should be in cleaned format (output of preprocess.py) with same features as training.
-    """
-    logger.info(f"Starting inference on {input_csv}")
+    """Run batch inference on a CSV file."""
+    logger.info("Starting inference on %s", input_csv)
     model, reverse_mapping, feature_names = load_model(model_path)
+
     df = pd.read_csv(input_csv)
-    logger.info(f"Loaded {len(df)} samples with {len(df.columns)} columns")
+    logger.info("Loaded %d samples with %d columns", len(df), len(df.columns))
     X = preprocess_input(df, feature_names=feature_names)
-    
-    # Check if we have the expected features
-    # Note: In a production system, you'd want to ensure feature alignment
-    # For now, we'll use whatever features are available
-    
-    # Make predictions
+
     y_pred, y_proba = predict(model, X, reverse_mapping, return_proba=True)
-    
-    # Add predictions to dataframe
+
     df['Prediction'] = y_pred
-    # Add per-class probabilities
-    n_classes = y_proba.shape[1]
-    for class_idx in range(n_classes):
+    for class_idx in range(y_proba.shape[1]):
         class_label = reverse_mapping.get(class_idx, str(class_idx))
-        safe_label = str(class_label).replace(" ", "_").replace("/", "_")
+        safe_label = str(class_label).replace(' ', '_').replace('/', '_')
         df[f'Probability_{safe_label}'] = y_proba[:, class_idx]
-    
-    # Log summary
+
     prediction_counts = pd.Series(y_pred).value_counts()
-    logger.info(f"\nPrediction Summary:")
-    logger.info(f"{prediction_counts}")
-    
+    logger.info("\nPrediction Summary:\n%s", prediction_counts)
+
     if output_csv:
         out = Path(output_csv)
         out.parent.mkdir(parents=True, exist_ok=True)
         df.to_csv(output_csv, index=False)
-        logger.info(f"Predictions saved to {output_csv}")
+        logger.info("Predictions saved to %s", output_csv)
     else:
-        # Print first few predictions (prediction + top-1 probability)
         logger.info("\nFirst 10 predictions:")
         proba_cols = [c for c in df.columns if c.startswith('Probability_')]
         print(df[['Prediction'] + proba_cols].head(10))
-    
+
     return df
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Run inference using trained XGBoost model"
+        description="Run inference using trained IDS model"
     )
-    parser.add_argument(
-        "--input",
-        type=str,
-        required=True,
-        help="Path to input CSV file for prediction"
-    )
-    parser.add_argument(
-        "--model",
-        type=str,
-        default=str(config.DEFAULT_MODEL),
-        help="Path to trained model file"
-    )
-    parser.add_argument(
-        "--output",
-        type=str,
-        default=None,
-        help="Path to save predictions (optional)"
-    )
-    
+    parser.add_argument("--input", type=str, required=True,
+                        help="Path to input CSV file for prediction")
+    parser.add_argument("--model", type=str, default=str(config.DEFAULT_MODEL),
+                        help="Path to trained model file")
+    parser.add_argument("--output", type=str, default=None,
+                        help="Path to save predictions (optional)")
+
     args = parser.parse_args()
-    
+
     try:
         run_inference(args.input, args.model, args.output)
         logger.info("Inference completed successfully!")
     except Exception as e:
-        logger.error(f"Inference failed: {e}")
+        logger.error("Inference failed: %s", e)
         raise

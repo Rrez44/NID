@@ -1,19 +1,24 @@
 """
 Data preprocessing script for IDS thesis project.
 
-Implements the full cleaning pipeline based on the CICIDS2017 analysis notebook:
+Implements the *leak-safe* cleaning pipeline for CICIDS2017.
+Only structural / domain-knowledge transforms happen here.
+All *data-dependent* feature selection (zero-variance, correlation, irrelevant
+features) is deferred to post-split via ``feature_selection.FeatureSelector``
+in the training script.
+
+Steps performed:
 1. Strip whitespace from column names
 2. Drop non-generalizable identifiers (IP, Flow ID, Timestamp)
 3. Remove duplicate rows
-4. Remove perfectly/near-perfectly duplicate columns
+4. Remove perfectly duplicate columns (hash-based, memory-efficient)
 5. Replace infinities with NaN then drop rows with NaN (minimal loss)
-6. Remove zero-variance columns
-7. Group fine-grained attack labels into 7 semantic categories
-8. Remove extremely rare attack categories (< min_class_count samples)
-9. Remove highly correlated features (threshold configurable, default 0.95)
-10. Remove statistically irrelevant features (hard-coded list from Kruskal-Wallis + RF analysis)
-11. Keep Source_File column for train/test splitting
+6. Group fine-grained attack labels into 7 semantic categories
+7. Remove extremely rare attack categories (< min_class_count samples)
+8. Keep Source_File column for file-based train/test splitting
 """
+
+import hashlib
 
 import pandas as pd
 import numpy as np
@@ -61,18 +66,6 @@ ATTACK_GROUP_MAPPING = {
     'Heartbleed':                   'Heartbleed',
 }
 
-# Features identified as statistically irrelevant by Kruskal-Wallis + RF analysis
-IRRELEVANT_FEATURES = [
-    'ECE Flag Count',
-    'RST Flag Count',
-    'Fwd URG Flags',
-    'Idle Std',
-    'Fwd PSH Flags',
-    'Active Std',
-    'Down/Up Ratio',
-    'URG Flag Count',
-]
-
 # Rare classes to drop entirely (too few samples to learn from reliably)
 RARE_CLASSES = {'Infiltration', 'Heartbleed'}
 
@@ -86,16 +79,16 @@ def validate_data(df):
 
 
 def remove_duplicate_columns(df, skip_cols=('Label', 'Source_File')):
-    """Remove columns whose data is identical to another column (keep first occurrence)."""
+    """Remove columns with identical values using SHA-256 hashing (memory-efficient)."""
     cols = [c for c in df.columns if c not in skip_cols]
+    seen_hashes = {}
     to_drop = []
-    seen = {}
     for col in cols:
-        key = tuple(df[col].values)
-        if key in seen:
+        h = hashlib.sha256(df[col].values.tobytes()).hexdigest()
+        if h in seen_hashes:
             to_drop.append(col)
         else:
-            seen[key] = col
+            seen_hashes[h] = col
     if to_drop:
         logger.info(f"Dropping {len(to_drop)} duplicate-value columns: {to_drop}")
         df = df.drop(columns=to_drop)
@@ -104,41 +97,9 @@ def remove_duplicate_columns(df, skip_cols=('Label', 'Source_File')):
     return df
 
 
-def remove_zero_variance_columns(df, skip_cols=('Label', 'Source_File', 'Attack Type')):
-    """Remove columns that contain only a single unique value."""
-    num_cols = [c for c in df.select_dtypes(include=[np.number]).columns if c not in skip_cols]
-    zero_var = [c for c in num_cols if df[c].nunique() <= 1]
-    if zero_var:
-        logger.info(f"Dropping {len(zero_var)} zero-variance columns: {zero_var}")
-        df = df.drop(columns=zero_var)
-    else:
-        logger.info("No zero-variance columns found.")
-    return df
-
-
-def remove_highly_correlated_features(df, threshold=0.95, skip_cols=('Label', 'Source_File', 'Attack Type')):
-    """
-    Remove one feature from each pair with absolute correlation above threshold.
-    Keeps the first of each correlated pair (alphabetically earlier column).
-    """
-    num_cols = [c for c in df.select_dtypes(include=[np.number]).columns if c not in skip_cols]
-    corr_matrix = df[num_cols].corr().abs()
-    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
-    to_drop = [col for col in upper.columns if any(upper[col] > threshold)]
-    if to_drop:
-        logger.info(f"Dropping {len(to_drop)} highly correlated features (threshold={threshold}): {to_drop}")
-        df = df.drop(columns=to_drop)
-    else:
-        logger.info(f"No features with correlation > {threshold} found.")
-    return df
-
-
 def group_attack_labels(df):
     """Map fine-grained attack labels to semantic groups."""
-    # Normalise label text first (strip whitespace)
     df['Label'] = df['Label'].astype(str).str.strip()
-
-    # Try direct mapping; fall back to 'Unknown' for anything not in the map
     df['Attack Type'] = df['Label'].map(ATTACK_GROUP_MAPPING)
 
     unmapped = df[df['Attack Type'].isna()]['Label'].unique()
@@ -150,15 +111,18 @@ def group_attack_labels(df):
     return df
 
 
-def preprocess_csv(input_csv, output_csv, corr_threshold=0.95, min_class_count=100):
+def preprocess_csv(input_csv, output_csv, min_class_count=100):
     """
-    Full preprocessing pipeline for CICIDS2017.
+    Leak-safe preprocessing pipeline for CICIDS2017.
+
+    Only applies transforms that do NOT depend on data statistics:
+    identifier removal, deduplication, inf/NaN handling, label grouping.
+    Data-dependent feature selection is handled post-split by FeatureSelector.
 
     Args:
         input_csv (str): Path to merged CSV file (output of merge_data.py)
         output_csv (str): Path to save cleaned CSV
-        corr_threshold (float): Correlation threshold for feature removal (default 0.95)
-        min_class_count (int): Drop attack groups with fewer than this many samples (default 100)
+        min_class_count (int): Drop attack groups with fewer than this many samples
     """
     logger.info(f"Starting preprocessing: {input_csv}")
 
@@ -190,12 +154,12 @@ def preprocess_csv(input_csv, output_csv, corr_threshold=0.95, min_class_count=1
     removed = before - len(df)
     logger.info(f"  Removed {removed:,} duplicate rows ({removed/before*100:.1f}%). Shape: {df.shape}")
 
-    # ── Step 4: Remove duplicate columns ──────────────────────────────────────
+    # ── Step 4: Remove duplicate columns (hash-based) ────────────────────────
     logger.info("Step 4: Removing duplicate-value columns...")
     df = remove_duplicate_columns(df)
     logger.info(f"  Shape after: {df.shape}")
 
-    # ── Step 5: Handle infinities → NaN → drop rows ───────────────────────────
+    # ── Step 5: Handle infinities → NaN → drop rows ──────────────────────────
     logger.info("Step 5: Handling infinities and missing values...")
     inf_count = np.isinf(df.select_dtypes(include=[np.number])).sum().sum()
     if inf_count > 0:
@@ -208,22 +172,17 @@ def preprocess_csv(input_csv, output_csv, corr_threshold=0.95, min_class_count=1
         df = df.dropna()
     logger.info(f"  Shape after: {df.shape}")
 
-    # ── Step 6: Remove zero-variance columns ──────────────────────────────────
-    logger.info("Step 6: Removing zero-variance columns...")
-    df = remove_zero_variance_columns(df)
-    logger.info(f"  Shape after: {df.shape}")
-
-    # ── Step 7: Group attack labels ───────────────────────────────────────────
-    logger.info("Step 7: Grouping attack labels into semantic categories...")
+    # ── Step 6: Group attack labels ───────────────────────────────────────────
+    logger.info("Step 6: Grouping attack labels into semantic categories...")
     before_counts = df['Label'].value_counts()
     logger.info(f"  Original label distribution:\n{before_counts}")
     df = group_attack_labels(df)
 
-    # ── Step 8: Remove rare attack classes ────────────────────────────────────
-    logger.info(f"Step 8: Removing rare attack classes (< {min_class_count} samples or in RARE_CLASSES list)...")
+    # ── Step 7: Remove rare attack classes ────────────────────────────────────
+    logger.info(f"Step 7: Removing rare attack classes (< {min_class_count} samples or in RARE_CLASSES list)...")
     class_counts = df['Attack Type'].value_counts()
     rare = set(class_counts[class_counts < min_class_count].index) | RARE_CLASSES
-    rare = rare & set(df['Attack Type'].unique())  # only what actually exists
+    rare = rare & set(df['Attack Type'].unique())
     if rare:
         before_rare = len(df)
         df = df[~df['Attack Type'].isin(rare)]
@@ -234,20 +193,9 @@ def preprocess_csv(input_csv, output_csv, corr_threshold=0.95, min_class_count=1
 
     logger.info(f"  Final Attack Type distribution:\n{df['Attack Type'].value_counts()}")
 
-    # ── Step 9: Remove highly correlated features ─────────────────────────────
-    logger.info(f"Step 9: Removing highly correlated features (threshold={corr_threshold})...")
-    df = remove_highly_correlated_features(df, threshold=corr_threshold)
-    logger.info(f"  Shape after: {df.shape}")
-
-    # ── Step 10: Remove statistically irrelevant features ────────────────────
-    logger.info("Step 10: Removing statistically irrelevant features...")
-    existing_irrelevant = [c for c in IRRELEVANT_FEATURES if c in df.columns]
-    if existing_irrelevant:
-        df = df.drop(columns=existing_irrelevant)
-        logger.info(f"  Dropped: {existing_irrelevant}")
-    else:
-        logger.info("  None of the irrelevant features were present.")
-    logger.info(f"  Shape after: {df.shape}")
+    # NOTE: Zero-variance removal, correlation filtering, and irrelevant-feature
+    # removal have been moved to training/feature_selection.py (post-split) to
+    # prevent data leakage.  The FeatureSelector is fit on training data only.
 
     # ── Final validation ──────────────────────────────────────────────────────
     if df.empty:
@@ -280,10 +228,6 @@ if __name__ == "__main__":
         help="Path to output preprocessed CSV file"
     )
     parser.add_argument(
-        "--corr-threshold", type=float, default=0.95,
-        help="Pearson correlation threshold for feature removal (default: 0.95)"
-    )
-    parser.add_argument(
         "--min-class-count", type=int, default=100,
         help="Drop attack groups with fewer than this many samples (default: 100)"
     )
@@ -293,7 +237,6 @@ if __name__ == "__main__":
     try:
         preprocess_csv(
             args.input, args.output,
-            corr_threshold=args.corr_threshold,
             min_class_count=args.min_class_count,
         )
         logger.info("Preprocessing completed successfully!")
