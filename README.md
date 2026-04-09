@@ -148,6 +148,81 @@ curl -X POST http://localhost:8000/predict \
   -d '{"features": {"Destination Port": 80, "Flow Duration": 1234, ...}}'
 ```
 
+## Live IDS CLI
+
+The `live_ids` package adds a terminal application that captures live network
+traffic (or replays a PCAP), assembles bidirectional flows, transforms each
+completed flow into the 40-feature dict the trained model expects, and POSTs
+each one to the running FastAPI server. The CLI is a **pure client** of
+`POST /predict` — it never loads the model itself.
+
+### Install
+
+```bash
+sudo apt install libpcap-dev          # libpcap headers (Debian/Ubuntu)
+pip install -r requirements.txt       # adds nfstream, scapy, httpx
+```
+
+For live capture without sudo, grant raw-socket capability to the venv
+interpreter once:
+
+```bash
+sudo setcap cap_net_raw,cap_net_admin=eip $(readlink -f $(which python))
+```
+
+### Quickstart
+
+```bash
+# Terminal 1: train (once) and start the API
+make train
+make serve
+
+# Terminal 2: self-check the feature mapping against the model artifact
+python -m live_ids validate
+
+# Terminal 3a: replay a PCAP through the pipeline
+python -m live_ids capture --pcap sample.pcap
+
+# Terminal 3b: live capture, only print non-benign predictions
+python -m live_ids capture -i eth0 --bpf-filter 'tcp' --only-non-benign
+```
+
+`make live-validate` and `make live-capture IFACE=eth0` wrap the above.
+
+### Subcommands
+
+| Command | Purpose |
+|---|---|
+| `capture` | Capture packets (`-i IFACE`) or replay a PCAP (`--pcap FILE`); POST each completed flow to the API and print predictions |
+| `validate` | Assert that `live_ids/features.py:FEATURE_NAMES` matches `models/xgb_ids_model_feature_names.pkl`; smoke-test a synthetic flow; with `--pcap`, also run a real PCAP through the mapping |
+| `info` | Print the active capture engine (`nfstream` or `scapy`) and the API `/health` + `/classes` |
+
+Notable `capture` flags: `--engine {auto,nfstream,scapy}`, `--api-url`,
+`--idle-timeout`, `--active-timeout`, `--active-gap`, `--bpf-filter`,
+`--min-confidence`, `--only-non-benign`, `--json`, `--dry-run`,
+`--max-flows`, `--debug`. Run `python -m live_ids capture --help` for the
+full list.
+
+### Failure modes
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `IDS API unreachable` | `make serve` not running | start the API |
+| `model not loaded` | server up but `.pkl` artifacts missing | `make train` |
+| `permission denied` on live capture | no `CAP_NET_RAW` | use sudo or `setcap` (above) |
+| `Missing features: [...]` (HTTP 422) | feature-mapping drift | `python -m live_ids validate` and inspect `FEATURE_SOURCE` |
+
+### Approximations
+
+`live_ids` provides approximate CICFlowMeter compatibility via nfstream plus
+an `NFPlugin` hook (or a scapy fallback when nfstream is unavailable).
+Features marked `S` (synthesized) in `live_ids/features.py:FEATURE_SOURCE`
+are computed from raw per-packet state inside the capture loop. The
+`validate` subcommand verifies that all 40 expected feature names are
+produced and finite. Active/Idle period statistics are clipped at 8192
+packets per flow (`MAX_TS_PER_FLOW` in `live_ids/capture.py`); flows beyond
+that cap get approximate Active stats.
+
 ## Evaluation Metrics
 
 The training script reports both **weighted** and **macro** averaged metrics:

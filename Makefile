@@ -1,9 +1,10 @@
 PYTHON   ?= python
 MODELS   := models
 DATA     := data/merged
+IFACE    ?= eth0
 
 .PHONY: help all merge preprocess train train-rf train-tune train-ablation \
-        shap serve clean
+        shap serve live-validate live-capture clean
 
 help:                                    ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -41,6 +42,12 @@ shap:                                    ## Train + SHAP interpretability
 
 serve:                                   ## Start FastAPI inference server (port 8000)
 	uvicorn api.serve:app --host 0.0.0.0 --port 8000 --reload
+
+live-validate:                           ## Self-check live_ids feature mapping vs model
+	$(PYTHON) -m live_ids validate
+
+live-capture:                            ## Run live IDS on $(IFACE) (requires CAP_NET_RAW)
+	$(PYTHON) -m live_ids capture -i $(IFACE) --only-non-benign
 
 clean:                                   ## Remove generated artifacts
 	rm -f $(DATA)/*.csv
