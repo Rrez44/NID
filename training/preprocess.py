@@ -35,8 +35,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Attack type grouping: fine-grained label -> semantic group
+# Attack type grouping: fine-grained label -> semantic group.
+# Covers both CIC-IDS2017 and CSE-CIC-IDS2018 label variants.
 ATTACK_GROUP_MAPPING = {
+    # ── CIC-IDS2017 ──────────────────────────────────────────────────────────
     'BENIGN':                       'Normal Traffic',
     'DoS Hulk':                     'DoS',
     'DoS GoldenEye':                'DoS',
@@ -64,9 +66,30 @@ ATTACK_GROUP_MAPPING = {
     'Web Attack \ufffd Sql Injection':'Web Attacks',
     'Infiltration':                 'Infiltration',
     'Heartbleed':                   'Heartbleed',
+
+    # ── CSE-CIC-IDS2018 ──────────────────────────────────────────────────────
+    'Benign':                       'Normal Traffic',
+    'DoS attacks-Hulk':             'DoS',
+    'DoS attacks-SlowHTTPTest':     'DoS',
+    'DoS attacks-GoldenEye':        'DoS',
+    'DoS attacks-Slowloris':        'DoS',
+    'DDoS attacks-LOIC-HTTP':       'DDoS',
+    'DDOS attack-HOIC':             'DDoS',
+    'DDOS attack-LOIC-UDP':         'DDoS',
+    'FTP-BruteForce':               'Brute Force',
+    'SSH-Bruteforce':               'Brute Force',
+    # 2018 "Brute Force" web attacks map to the same Web Attacks group as 2017.
+    'Brute Force -Web':             'Web Attacks',
+    'Brute Force -XSS':             'Web Attacks',
+    'SQL Injection':                'Web Attacks',
+    # NOTE: 'Infilteration' is the exact spelling in the 2018 CSVs — not a typo
+    # in this mapping. Both 'Infiltration' (2017) and 'Infilteration' (2018)
+    # land in the RARE_CLASSES set below and are dropped.
+    'Infilteration':                'Infiltration',
+    # 'Bot' is already mapped above and applies to 2018 as well.
 }
 
-# Rare classes to drop entirely (too few samples to learn from reliably)
+# Rare classes to drop entirely (too few samples to learn from reliably).
 RARE_CLASSES = {'Infiltration', 'Heartbleed'}
 
 
@@ -78,7 +101,7 @@ def validate_data(df):
     logger.info(f"Data validation passed. Shape: {df.shape}, Columns: {len(df.columns)}")
 
 
-def remove_duplicate_columns(df, skip_cols=('Label', 'Source_File')):
+def remove_duplicate_columns(df, skip_cols=('Label', 'Source_File', 'Dataset', 'Attack Type')):
     """Remove columns with identical values using SHA-256 hashing (memory-efficient)."""
     cols = [c for c in df.columns if c not in skip_cols]
     seen_hashes = {}
@@ -129,10 +152,66 @@ def preprocess_csv(input_csv, output_csv, min_class_count=100):
     if not Path(input_csv).exists():
         raise FileNotFoundError(f"Input file not found: {input_csv}")
 
-    # ── Load ──────────────────────────────────────────────────────────────────
-    logger.info("Loading CSV file...")
-    df = pd.read_csv(input_csv)
-    logger.info(f"Loaded dataframe shape: {df.shape}")
+    # ── Load (streaming + float32 + per-chunk dedup to keep peak memory low) ─
+    # The combined 2017+2018 merged CSV is large enough that a single-shot
+    # pd.read_csv blows past available RAM (float64 default), and a
+    # single-shot drop_duplicates on the concatenated frame does the same.
+    # We stream in chunks and do as much work per-chunk as possible:
+    #   - drop identifier columns early (fewer cols → cheaper dedup)
+    #   - defensively coerce object-dtype feature columns to numeric
+    #   - downcast float64 → float32 (halves memory)
+    #   - inf → NaN → dropna
+    #   - per-chunk drop_duplicates (most CIC duplicates are adjacent in
+    #     time, so nearly all are intra-chunk)
+    # Peak memory is then roughly the size of the final cleaned frame.
+    logger.info("Loading CSV in chunks (float32 + per-chunk dedup)...")
+    non_feature = {'Label', 'Source_File', 'Dataset', 'Attack Type'}
+    drop_identifiers = ['Flow ID', 'Src IP', 'Dst IP', 'Timestamp',
+                        'Src Port', 'Protocol']
+
+    chunks = []
+    raw_rows = 0
+    kept_rows = 0
+    for i, chunk in enumerate(
+        pd.read_csv(input_csv, chunksize=1_000_000, low_memory=False)
+    ):
+        raw_rows += len(chunk)
+        chunk.columns = chunk.columns.str.strip()
+
+        # Drop identifier columns early (reduces dedup column count).
+        existing = [c for c in drop_identifiers if c in chunk.columns]
+        if existing:
+            chunk = chunk.drop(columns=existing)
+
+        # Defensive: coerce object-dtype feature cols to numeric
+        # (2018 files had stray strings from Excel-truncated shards).
+        for c in chunk.columns:
+            if c not in non_feature and chunk[c].dtype == object:
+                chunk[c] = pd.to_numeric(chunk[c], errors='coerce')
+
+        # Downcast float64 → float32 (halves feature-column memory).
+        for c in chunk.select_dtypes(include=['float64']).columns:
+            chunk[c] = chunk[c].astype('float32')
+
+        # inf → NaN → dropna per chunk to shrink before concat.
+        chunk.replace([np.inf, -np.inf], np.nan, inplace=True)
+        chunk = chunk.dropna()
+
+        # Per-chunk dedup: cheap (1M-row dedup) and catches most duplicates
+        # since CIC datasets' duplicate rows come from the flow exporter
+        # re-emitting the same flow on timeout (adjacent in time).
+        chunk = chunk.drop_duplicates(keep='first')
+
+        kept_rows += len(chunk)
+        chunks.append(chunk)
+        logger.info(
+            f"  chunk {i+1}: read={len(chunk):,} kept "
+            f"(cumulative read={raw_rows:,}, kept={kept_rows:,})"
+        )
+
+    df = pd.concat(chunks, ignore_index=True)
+    del chunks
+    logger.info(f"Streaming load complete. Shape: {df.shape}")
     validate_data(df)
 
     # ── Step 1: Clean column names ────────────────────────────────────────────
@@ -141,18 +220,42 @@ def preprocess_csv(input_csv, output_csv, min_class_count=100):
 
     # ── Step 2: Drop identifiers ──────────────────────────────────────────────
     logger.info("Step 2: Dropping non-generalizable identifier columns...")
-    drop_cols = ['Flow ID', 'Src IP', 'Dst IP', 'Timestamp']
+    drop_cols = ['Flow ID', 'Src IP', 'Dst IP', 'Timestamp',
+                 'Src Port', 'Protocol']  # 2018-only leftovers if merge ran without canonicalization
     existing_drop = [c for c in drop_cols if c in df.columns]
     if existing_drop:
         df = df.drop(columns=existing_drop)
         logger.info(f"  Dropped: {existing_drop}")
 
-    # ── Step 3: Remove duplicate rows ─────────────────────────────────────────
-    logger.info("Step 3: Removing duplicate rows...")
+    # ── Step 2b: Coerce feature columns to numeric ───────────────────────────
+    # Some 2018 CSVs have object-dtype feature columns (stray header rows, mixed
+    # values). Coerce now so inf/NaN handling and dedup work on clean floats.
+    non_feature = {'Label', 'Source_File', 'Dataset', 'Attack Type'}
+    feature_cols = [c for c in df.columns if c not in non_feature]
+    object_cols = [c for c in feature_cols if df[c].dtype == object]
+    if object_cols:
+        logger.info(f"Step 2b: Coercing {len(object_cols)} object-dtype feature columns to numeric")
+        for c in object_cols:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+
+    # ── Step 3: Remove cross-chunk duplicate rows (hash-based) ───────────────
+    # Intra-chunk duplicates were already removed per-chunk in the loader.
+    # Here we catch cross-chunk duplicates. Hashing each row to a single
+    # uint64 cuts memory dramatically vs comparing ~74 float32 columns:
+    # row_hash is ~150 MB for 18.9M rows and dedup on a single column
+    # fits comfortably in RAM.
+    logger.info("Step 3: Removing cross-chunk duplicate rows (hash-based)...")
     before = len(df)
-    df = df.drop_duplicates(keep='first')
+    row_hash = pd.util.hash_pandas_object(df, index=False)
+    mask = ~row_hash.duplicated(keep='first')
+    del row_hash
+    df = df[mask].reset_index(drop=True)
+    del mask
     removed = before - len(df)
-    logger.info(f"  Removed {removed:,} duplicate rows ({removed/before*100:.1f}%). Shape: {df.shape}")
+    logger.info(
+        f"  Removed {removed:,} cross-chunk duplicate rows "
+        f"({removed/before*100:.2f}%). Shape: {df.shape}"
+    )
 
     # ── Step 4: Remove duplicate columns (hash-based) ────────────────────────
     logger.info("Step 4: Removing duplicate-value columns...")

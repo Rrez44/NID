@@ -30,6 +30,26 @@ IRRELEVANT_FEATURES = [
     'URG Flag Count',
 ]
 
+# Environment-specific features that encode the *capture environment* (TCP
+# stack, NIC, OS, lab topology) rather than *attack behaviour*.  Dropping
+# these is the first-line fix when cross-dataset F1-macro is low: the model
+# can no longer fingerprint "2017 VM" vs "2018 AWS" via these columns and
+# is forced to rely on flow-shape / timing features that transfer.
+#
+# - Init_Win_bytes_{forward,backward}: initial TCP receive window; depends
+#   on OS stack defaults (Windows 7 vs modern Linux vs AWS Nitro).
+# - min_seg_size_forward: minimum TCP header length in bytes (20/24/32),
+#   depends on which TCP options the stack negotiates (SACK, Timestamp).
+# - Fwd/Bwd Header Length: sum of header bytes per direction — same
+#   TCP-option sensitivity as above.
+ENV_SPECIFIC_FEATURES = [
+    'Init_Win_bytes_forward',
+    'Init_Win_bytes_backward',
+    'min_seg_size_forward',
+    'Fwd Header Length',
+    'Bwd Header Length',
+]
+
 
 class FeatureSelector:
     """
@@ -37,16 +57,23 @@ class FeatureSelector:
     and domain-irrelevant features.  Fit on training data only to prevent leakage.
     """
 
-    def __init__(self, corr_threshold=0.95, irrelevant_features=None, drop_port=False):
+    def __init__(self, corr_threshold=0.95, irrelevant_features=None,
+                 drop_port=False, drop_env_features=False,
+                 env_features=None):
         self.corr_threshold = corr_threshold
         self.irrelevant_features = (
             irrelevant_features if irrelevant_features is not None else IRRELEVANT_FEATURES
         )
         self.drop_port = drop_port
+        self.drop_env_features = drop_env_features
+        self.env_features = (
+            env_features if env_features is not None else ENV_SPECIFIC_FEATURES
+        )
 
         self.zero_var_cols_ = None
         self.correlated_cols_ = None
         self.dropped_irrelevant_ = None
+        self.dropped_env_ = None
         self.feature_names_out_ = None
 
     def fit(self, X):
@@ -88,6 +115,18 @@ class FeatureSelector:
             drop.add('Destination Port')
             logger.info("FeatureSelector – ablation: dropping Destination Port")
 
+        # 5. Optional environment-specific feature drop (cross-dataset hardening)
+        if self.drop_env_features:
+            self.dropped_env_ = [f for f in self.env_features if f in X.columns]
+            drop.update(self.dropped_env_)
+            if self.dropped_env_:
+                logger.info(
+                    "FeatureSelector – environment-specific (cross-dataset hardening): %s",
+                    self.dropped_env_,
+                )
+        else:
+            self.dropped_env_ = []
+
         self.feature_names_out_ = [c for c in X.columns if c not in drop]
         logger.info(
             "FeatureSelector: keeping %d / %d features (dropped %d)",
@@ -124,11 +163,14 @@ class FeatureSelector:
         return {
             'corr_threshold': self.corr_threshold,
             'drop_port': self.drop_port,
+            'drop_env_features': self.drop_env_features,
             'n_zero_var': len(self.zero_var_cols_ or []),
             'n_correlated': len(self.correlated_cols_ or []),
             'n_irrelevant': len(self.dropped_irrelevant_ or []),
+            'n_env': len(self.dropped_env_ or []),
             'n_features_out': len(self.feature_names_out_ or []),
             'zero_var_cols': self.zero_var_cols_,
             'correlated_cols': self.correlated_cols_,
             'dropped_irrelevant': self.dropped_irrelevant_,
+            'dropped_env': self.dropped_env_,
         }

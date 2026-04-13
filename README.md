@@ -32,8 +32,8 @@ ids-thesis/
 │   └── experiment_*.json           # Experiment logs
 ├── data/
 │   ├── raw/                        # Raw dataset files
-│   │   ├── MachineLearningCSV.zip
-│   │   └── MachineLearningCVE/     # Individual CSV files
+│   │   ├── MachineLearningCVE/     # CIC-IDS2017 per-day CSVs
+│   │   └── cicids2018/             # CSE-CIC-IDS2018 per-day CSVs (optional)
 │   └── merged/                     # Processed data
 │       ├── MachineLearningCSV_merged.csv
 │       └── MachineLearningCSV_cleaned.csv
@@ -52,6 +52,15 @@ Inverse-frequency sample weights (`sklearn.utils.class_weight.compute_sample_wei
 ### Session Leakage Prevention
 GroupKFold cross-validation uses `Source_File` as the group key, ensuring no flows from the same capture file appear in both train and validation folds.
 
+### Cross-Dataset Generalization
+The pipeline supports **two datasets simultaneously** — CIC-IDS2017 (the original) and CSE-CIC-IDS2018. Rows are tagged with a `Dataset` column during merge, which unlocks two extra split strategies in [training/train_xgb.py](training/train_xgb.py):
+
+- `cross_dataset_2017to2018` — train on all 2017, test on all 2018 (zero-shot)
+- `cross_dataset_2018to2017` — reverse
+- `mixed_holdout` — 70/30 file-holdout split stratified by year so each dataset appears in both train and test
+
+Cross-dataset splits are the honest test of whether the model learned generalizable attack patterns vs. host-specific fingerprints (e.g. `Init_Win_bytes_backward == 235` for a specific Apache build in 2017).
+
 ## Installation
 
 ```bash
@@ -62,16 +71,45 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
+## Datasets
+
+### CIC-IDS2017 (required)
+Place per-day CSVs under `data/raw/MachineLearningCVE/`. Source: https://www.unb.ca/cic/datasets/ids-2017.html.
+
+### CSE-CIC-IDS2018 (optional, enables cross-dataset evaluation)
+Place the 10 `TrafficForML_CICFlowMeter.csv` files under `data/raw/cicids2018/`:
+
+```
+data/raw/cicids2018/
+├── Wednesday-14-02-2018_TrafficForML_CICFlowMeter.csv   # FTP/SSH Brute Force
+├── Thursday-15-02-2018_TrafficForML_CICFlowMeter.csv    # DoS (GoldenEye, Slowloris)
+├── Friday-16-02-2018_TrafficForML_CICFlowMeter.csv      # DoS (Hulk, SlowHTTPTest)
+├── Thuesday-20-02-2018_TrafficForML_CICFlowMeter.csv    # DDoS (LOIC-HTTP) — note misspelled filename
+├── Wednesday-21-02-2018_TrafficForML_CICFlowMeter.csv   # DDoS (LOIC-UDP, HOIC)
+├── Thursday-22-02-2018_TrafficForML_CICFlowMeter.csv    # Web Attacks
+├── Friday-23-02-2018_TrafficForML_CICFlowMeter.csv      # Web Attacks
+├── Wednesday-28-02-2018_TrafficForML_CICFlowMeter.csv   # Infiltration
+├── Thursday-01-03-2018_TrafficForML_CICFlowMeter.csv    # Infiltration
+└── Friday-02-03-2018_TrafficForML_CICFlowMeter.csv      # Bot
+```
+
+Total size: ~6.5 GB. Source: https://www.unb.ca/cic/datasets/ids-2018.html (or `aws s3 sync --no-sign-request s3://cse-cic-ids2018/Processed\ Traffic\ Data\ for\ ML\ Algorithms/ data/raw/cicids2018/`).
+
+Once present, `merge_data.py` picks up both directories automatically; no config changes needed.
+
 ## Quick Start (Makefile)
 
 ```bash
-make all           # Full pipeline: merge → preprocess → train
-make train-rf      # Random Forest baseline
-make train-tune    # XGBoost with Optuna hyperparameter tuning
-make train-ablation # XGBoost without Destination Port (ablation study)
-make shap          # Train + SHAP interpretability analysis
-make serve         # Start FastAPI inference server on port 8000
-make help          # Show all available targets
+make all                         # Full pipeline: merge → preprocess → train
+make train-rf                    # Random Forest baseline
+make train-tune                  # XGBoost with Optuna hyperparameter tuning
+make train-ablation              # XGBoost without Destination Port (ablation study)
+make train-mixed                 # 2017+2018 mixed file-holdout (requires 2018 data)
+make train-cross-2017to2018      # Zero-shot: train on 2017, test on 2018
+make train-cross-2018to2017      # Zero-shot: train on 2018, test on 2017
+make shap                        # Train + SHAP interpretability analysis
+make serve                       # Start FastAPI inference server on port 8000
+make help                        # Show all available targets
 ```
 
 ## Usage (Manual)
@@ -79,10 +117,26 @@ make help          # Show all available targets
 ### 1. Merge Raw Data Files
 
 ```bash
+# CIC-IDS2017 only (default when cicids2018/ is absent)
+python3 training/merge_data.py
+
+# Explicitly merge both 2017 and 2018
 python3 training/merge_data.py \
     --input-dir data/raw/MachineLearningCVE \
+    --input-dir data/raw/cicids2018 \
     --output data/merged/MachineLearningCSV_merged.csv
+
+# Downsample huge 2018 files during merge (e.g. 500k rows per file)
+python3 training/merge_data.py --max-rows-per-file 500000
 ```
+
+If `data/raw/cicids2018/` exists, `merge_data.py` picks it up automatically and tags rows with a `Dataset` column (`'2017'` / `'2018'`). The script also:
+
+- Canonicalizes 2018 column names to the 2017 schema (e.g. `Dst Port` → `Destination Port`, `Tot Fwd Pkts` → `Total Fwd Packets`).
+- Drops 2017's duplicate `Fwd Header Length.1`.
+- Drops 2018-only metadata (`Protocol`, `Timestamp`, `Flow ID`, `Src IP`, etc.).
+- Filters stray embedded header rows from the Excel-truncated 2018 files.
+- Streams in chunks (`--chunksize`) to keep peak memory low — the 4 GB Tuesday 2018 file won't blow up your RAM.
 
 ### 2. Preprocess Data
 
@@ -119,7 +173,18 @@ python3 training/train_xgb.py --shap --save-plots
 python3 training/train_xgb.py --no-class-weights
 ```
 
-**Split strategies:** `file_holdout` (default), `per_file`, `temporal`, `file`, `random`.
+**Split strategies:** `file_holdout` (default), `per_file`, `temporal`, `file`, `random`, `mixed_holdout`, `cross_dataset_2017to2018`, `cross_dataset_2018to2017`. The last three require the `Dataset` column from a two-year merge.
+
+#### Cross-dataset evaluation (CIC-IDS2017 ↔ CSE-CIC-IDS2018)
+
+```bash
+# Assumes data/raw/cicids2018/ is populated and you've re-run merge + preprocess.
+python3 training/train_xgb.py --split-strategy cross_dataset_2017to2018 --save-plots
+python3 training/train_xgb.py --split-strategy cross_dataset_2018to2017 --save-plots
+python3 training/train_xgb.py --split-strategy mixed_holdout --save-plots
+```
+
+A large gap between in-dataset F1-macro (e.g. 0.95 on `file_holdout`) and cross-dataset F1-macro (e.g. 0.25 on `cross_dataset_2017to2018`) is the quantitative signature of host-specific overfitting: the model relies on fingerprints like `Init_Win_bytes_backward` that are stable within a capture but change across years/tools.
 
 ### 4. Run Inference
 
@@ -302,13 +367,10 @@ https://github.com/Rrez44/NID/blob/main/LICENSE
 
 Rrezon Beqiri, University Of Prishtin
 
-<<<<<<< HEAD
 ## Citation
 
 If you use this code in your research, please cite!
 
-=======
->>>>>>> 1919e15 (Restructured architecture and processing)
 ## Acknowledgments
 
 - CICIDS2017 Dataset: https://www.unb.ca/cic/datasets/ids-2017.html

@@ -63,6 +63,35 @@ except ImportError:
 
 RANDOM_STATE = 42
 
+# Cross-dataset-friendly XGBoost hyperparameters.
+#
+# The default config (max_depth=6, n_estimators=100, lr=0.1, no regularization)
+# encourages the model to memorize the training distribution — ideal for within-
+# dataset metrics, catastrophic for cross-dataset generalization. This preset
+# pushes the model toward a simpler, more regularized decision surface:
+#
+#   - max_depth=4        shallower trees cannot fit environment-specific quirks
+#   - min_child_weight=10 each leaf needs real support (not 1-2 rows)
+#   - reg_lambda=2.0     L2 penalty on leaf weights
+#   - reg_alpha=0.1      L1 penalty → feature sparsity
+#   - subsample=0.8      row subsampling per tree (stochastic GBM)
+#   - colsample_bytree=0.8 column subsampling per tree
+#   - learning_rate=0.05 smaller step size …
+#   - n_estimators=300   … compensated by more boosting rounds
+#
+# This is the 'safe' preset to use with --hardened-hp. It is intentionally
+# independent of Optuna so cross-dataset runs do not require a tuning pass.
+HARDENED_XGB_PARAMS = dict(
+    max_depth=4,
+    min_child_weight=10,
+    reg_lambda=2.0,
+    reg_alpha=0.1,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    learning_rate=0.05,
+    n_estimators=300,
+)
+
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -446,12 +475,142 @@ def log_experiment(output_dir, *, model_type, params, split_strategy, metrics,
 
 # ─── Data splitting ───────────────────────────────────────────────────────────
 
-def split_data(X, y, source_file, strategy):
-    """Return X_train, X_test, y_train, y_test, groups_train."""
+def split_data(X, y, source_file, strategy, dataset=None):
+    """Return X_train, X_test, y_train, y_test, groups_train.
+
+    Extra strategies that use the `dataset` Series (values '2017' / '2018'):
+
+    * ``cross_dataset_2017to2018`` — train on all 2017 rows, test on all 2018
+      rows. Zero-shot generalization evaluation.
+    * ``cross_dataset_2018to2017`` — reverse of the above.
+    * ``mixed_holdout`` — 70/30 file-holdout split stratified by (dataset,
+      source_file) so each year contributes files to both train and test.
+    * ``fused_2018holdout`` — train on ALL 2017 + 80% of 2018 (row-level
+      stratified by attack type), test on 20% of 2018. Measures how much
+      target-domain labeled data is needed to close the cross-dataset gap.
+    * ``fused_2017holdout`` — reverse of fused_2018holdout.
+    """
     logger.info("Split strategy: %s", strategy)
     groups_train = None
 
-    if strategy == 'file_holdout' and source_file is not None:
+    if strategy in ('cross_dataset_2017to2018', 'cross_dataset_2018to2017'):
+        if dataset is None:
+            raise ValueError(
+                f"Split strategy '{strategy}' requires the 'Dataset' column "
+                "in the preprocessed CSV. Re-run merge_data.py to tag rows."
+            )
+        train_tag = '2017' if strategy == 'cross_dataset_2017to2018' else '2018'
+        test_tag = '2018' if strategy == 'cross_dataset_2017to2018' else '2017'
+        train_mask = dataset == train_tag
+        test_mask = dataset == test_tag
+        if not train_mask.any() or not test_mask.any():
+            raise ValueError(
+                f"Cross-dataset split needs both years present; got "
+                f"{train_tag}={train_mask.sum()}, {test_tag}={test_mask.sum()}"
+            )
+        X_train, X_test = X[train_mask], X[test_mask]
+        y_train, y_test = y[train_mask], y[test_mask]
+        if source_file is not None:
+            groups_train = source_file[train_mask]
+        logger.info(
+            "cross_dataset – train=%s (%s rows) → test=%s (%s rows)",
+            train_tag, f"{train_mask.sum():,}", test_tag, f"{test_mask.sum():,}",
+        )
+
+    elif strategy in ('fused_2018holdout', 'fused_2017holdout'):
+        if dataset is None:
+            raise ValueError(
+                f"Split strategy '{strategy}' requires the 'Dataset' column "
+                "in the preprocessed CSV. Re-run merge_data.py to tag rows."
+            )
+        # Fused training: all of one dataset + stratified row-level split of
+        # the other.  Row-level (not file-level) stratification guarantees
+        # every attack class appears in both train and test partitions,
+        # avoiding the mixed_holdout pathology where whole classes vanish
+        # from the test set.
+        holdout_tag = '2018' if strategy == 'fused_2018holdout' else '2017'
+        fused_tag = '2017' if holdout_tag == '2018' else '2018'
+
+        dataset_arr = dataset.values
+        holdout_mask = dataset_arr == holdout_tag
+        fused_mask = dataset_arr == fused_tag
+        if not holdout_mask.any() or not fused_mask.any():
+            raise ValueError(
+                f"Fused split needs both years present; got "
+                f"fused={fused_tag}={fused_mask.sum()}, "
+                f"holdout={holdout_tag}={holdout_mask.sum()}"
+            )
+
+        idx_holdout = np.where(holdout_mask)[0]
+        y_holdout = y.iloc[idx_holdout]
+
+        # Row-level stratified 80/20 split within the holdout dataset.
+        # Classes with <2 samples can't be stratified — those get pooled
+        # into training only (test would miss them anyway).
+        hold_counts = y_holdout.value_counts()
+        stratifiable = hold_counts[hold_counts >= 2].index
+        strat_mask = y_holdout.isin(stratifiable).values
+        idx_strat = idx_holdout[strat_mask]
+        idx_nostrat = idx_holdout[~strat_mask]
+
+        train_idx_strat, test_idx_strat = train_test_split(
+            idx_strat, test_size=0.20,
+            random_state=RANDOM_STATE,
+            stratify=y.iloc[idx_strat],
+        )
+
+        train_mask_np = np.zeros(len(X), dtype=bool)
+        train_mask_np[fused_mask] = True
+        train_mask_np[train_idx_strat] = True
+        train_mask_np[idx_nostrat] = True  # unstratifiable rows → train
+
+        test_mask_np = np.zeros(len(X), dtype=bool)
+        test_mask_np[test_idx_strat] = True
+
+        # Convert back to pandas boolean Series aligned to X's index so the
+        # downstream `X[mask]` path is identical to other strategies.
+        train_mask = pd.Series(train_mask_np, index=X.index)
+        test_mask = pd.Series(test_mask_np, index=X.index)
+
+        X_train, X_test = X[train_mask], X[test_mask]
+        y_train, y_test = y[train_mask], y[test_mask]
+        if source_file is not None:
+            groups_train = source_file[train_mask]
+        logger.info(
+            "%s – train=%s (all %s + 80%% of %s stratified), "
+            "test=%s (20%% of %s stratified)",
+            strategy, f"{train_mask.sum():,}", fused_tag,
+            holdout_tag, f"{test_mask.sum():,}", holdout_tag,
+        )
+
+    elif strategy == 'mixed_holdout' and source_file is not None:
+        # Hold out a quarter of each year's files so both datasets are present
+        # in train AND test. Groups = qualified Source_File for CV grouping.
+        rng = np.random.RandomState(RANDOM_STATE)
+        test_files: set[str] = set()
+        if dataset is not None:
+            for tag in sorted(dataset.dropna().unique()):
+                files_in_tag = sorted(source_file[dataset == tag].dropna().unique())
+                if not files_in_tag:
+                    continue
+                n_test = max(1, int(0.25 * len(files_in_tag)))
+                idx = rng.choice(len(files_in_tag), size=n_test, replace=False)
+                test_files.update(files_in_tag[i] for i in idx)
+        else:
+            files_all = sorted(source_file.dropna().unique())
+            n_test = max(2, int(0.25 * len(files_all)))
+            idx = rng.choice(len(files_all), size=n_test, replace=False)
+            test_files.update(files_all[i] for i in idx)
+        mask = source_file.isin(test_files)
+        X_train, X_test = X[~mask], X[mask]
+        y_train, y_test = y[~mask], y[mask]
+        groups_train = source_file[~mask]
+        logger.info(
+            "mixed_holdout – %d test files across years: %s",
+            len(test_files), sorted(test_files),
+        )
+
+    elif strategy == 'file_holdout' and source_file is not None:
         unique_files = sorted(source_file.dropna().unique())
         n_test = max(2, int(0.25 * len(unique_files)))
         rng = np.random.RandomState(RANDOM_STATE)
@@ -514,7 +673,9 @@ def split_data(X, y, source_file, strategy):
 
 def train_model(preprocessed_csv, model_path, *, model_type='xgb',
                 split_strategy='file_holdout', tune_method=None,
-                corr_threshold=0.95, drop_port=False, use_class_weights=True,
+                corr_threshold=0.95, drop_port=False,
+                drop_env_features=False, hardened_hp=False,
+                use_class_weights=True,
                 run_shap_flag=False, save_plots=False, output_dir=None):
     """
     Full training pipeline with post-split feature selection.
@@ -525,28 +686,64 @@ def train_model(preprocessed_csv, model_path, *, model_type='xgb',
         raise FileNotFoundError(f"Not found: {preprocessed_csv}")
 
     logger.info("Loading data from %s", preprocessed_csv)
-    df = pd.read_csv(preprocessed_csv)
-    logger.info("Loaded shape: %s", df.shape)
+    # The combined 2017+2018 preprocessed frame is ~14.5M rows × 68 cols and
+    # OOMs on single-shot pd.read_csv even with float32. Stream in chunks
+    # and concat at the end. Dataset/Source_File stay string so cross-dataset
+    # splits compare by tag instead of by int.
+    _header = pd.read_csv(preprocessed_csv, nrows=0)
+    _header.columns = _header.columns.str.strip()
+    _metadata_cols = {'Label', 'Source_File', 'Dataset', 'Attack Type'}
+    _dtype_map: dict[str, str] = {
+        c: 'float32' for c in _header.columns if c not in _metadata_cols
+    }
+    for _c in ('Label', 'Source_File', 'Dataset', 'Attack Type'):
+        if _c in _header.columns:
+            _dtype_map[_c] = 'string'
+
+    _chunks = []
+    _rows = 0
+    for _i, _chunk in enumerate(
+        pd.read_csv(preprocessed_csv, dtype=_dtype_map, chunksize=1_000_000)
+    ):
+        _rows += len(_chunk)
+        _chunks.append(_chunk)
+        logger.info("  load chunk %d: cumulative rows=%s", _i + 1, f"{_rows:,}")
+    df = pd.concat(_chunks, ignore_index=True)
+    del _chunks
+    logger.info("Loaded shape: %s (float32 feature dtype)", df.shape)
 
     # Identify label + metadata columns
     label_col = 'Attack Type' if 'Attack Type' in df.columns else 'Label'
     if label_col not in df.columns:
         raise ValueError("No label column found")
 
+    # Metadata Series are small — copy is cheap and decouples them from df.
     source_file = df['Source_File'].copy() if 'Source_File' in df.columns else None
-    non_feature = {label_col, 'Source_File', 'Label'}
-    feature_cols = [c for c in df.columns if c not in non_feature]
-    X = df[feature_cols].copy()
+    dataset_tag = df['Dataset'].copy() if 'Dataset' in df.columns else None
     y_raw = df[label_col].copy()
 
+    # X is the feature block — NO explicit .copy(). With pandas 3.0
+    # Copy-on-Write this is a lazy view on df's underlying arrays; the
+    # eager copy on 14.5M × ~64 float32 cols was doubling peak memory.
+    non_feature = {label_col, 'Source_File', 'Label', 'Dataset', 'Attack Type'}
+    feature_cols = [c for c in df.columns if c not in non_feature]
+    X = df[feature_cols]
+
     validate_training_data(X, y_raw)
+    # df is no longer needed; release the reference so the split stage
+    # doesn't carry the full frame alongside X/y.
+    del df
 
     # ── Split (on raw string labels) ─────────────────────────────────────────
     X_train, X_test, y_train_raw, y_test_raw, groups_train = split_data(
-        X, y_raw, source_file, split_strategy)
+        X, y_raw, source_file, split_strategy, dataset=dataset_tag)
 
     # ── Post-split feature selection (fit on train ONLY) ─────────────────────
-    selector = FeatureSelector(corr_threshold=corr_threshold, drop_port=drop_port)
+    selector = FeatureSelector(
+        corr_threshold=corr_threshold,
+        drop_port=drop_port,
+        drop_env_features=drop_env_features,
+    )
     X_train = selector.fit_transform(X_train)
     X_test = selector.transform(X_test)
     logger.info("Features after selection: %d", X_train.shape[1])
@@ -585,9 +782,17 @@ def train_model(preprocessed_csv, model_path, *, model_type='xgb',
             X_train, y_train, n_classes, cv,
             groups=cv_groups_for_split, sample_weight=sample_weight)
     else:
-        model = build_model(model_type, n_classes)
+        extra_params = {}
+        if hardened_hp and model_type == 'xgb':
+            extra_params = dict(HARDENED_XGB_PARAMS)
+            logger.info(
+                "Applying hardened cross-dataset hyperparameters: %s",
+                extra_params,
+            )
+        model = build_model(model_type, n_classes, params=extra_params)
         fit_kw = {'sample_weight': sample_weight} if sample_weight is not None else {}
-        logger.info("Training %s with default hyperparameters...", model_type.upper())
+        label = "hardened" if hardened_hp else "default"
+        logger.info("Training %s with %s hyperparameters...", model_type.upper(), label)
         model.fit(X_train, y_train, **fit_kw)
 
     logger.info("Training complete.")
@@ -651,7 +856,12 @@ def train_model(preprocessed_csv, model_path, *, model_type='xgb',
         dataset_path=preprocessed_csv,
         tune_method=tune_method,
         cv_f1_macro=cv_f1,
-        extra={'class_weights': use_class_weights, 'drop_port': drop_port},
+        extra={
+            'class_weights': use_class_weights,
+            'drop_port': drop_port,
+            'drop_env_features': drop_env_features,
+            'hardened_hp': hardened_hp,
+        },
     )
 
     return model
@@ -668,8 +878,14 @@ if __name__ == '__main__':
     parser.add_argument('--model-type', choices=('xgb', 'rf'), default='xgb',
                         help="xgb = XGBoost (default), rf = Random Forest baseline")
     parser.add_argument('--split-strategy',
-                        choices=('file_holdout', 'per_file', 'temporal', 'file', 'random'),
-                        default='file_holdout')
+                        choices=('file_holdout', 'per_file', 'temporal', 'file', 'random',
+                                 'mixed_holdout',
+                                 'cross_dataset_2017to2018',
+                                 'cross_dataset_2018to2017',
+                                 'fused_2018holdout',
+                                 'fused_2017holdout'),
+                        default='file_holdout',
+                        help="mixed_holdout / cross_dataset_* / fused_* require both datasets merged.")
     parser.add_argument('--tune', action='store_true',
                         help="Enable hyperparameter tuning")
     parser.add_argument('--tune-method', choices=('random', 'optuna'), default='optuna',
@@ -678,6 +894,15 @@ if __name__ == '__main__':
                         help="Pearson |r| threshold for correlated-feature removal")
     parser.add_argument('--drop-port', action='store_true',
                         help="Ablation: drop Destination Port feature")
+    parser.add_argument('--drop-env-features', action='store_true',
+                        help="Drop environment-specific features "
+                             "(Init_Win_bytes_*, min_seg_size_forward, "
+                             "Fwd/Bwd Header Length). Use for cross-dataset "
+                             "hardening to force attack-behaviour learning.")
+    parser.add_argument('--hardened-hp', action='store_true',
+                        help="Apply cross-dataset-friendly XGBoost "
+                             "hyperparameters (shallower trees, L1/L2, "
+                             "subsampling, smaller LR).")
     parser.add_argument('--no-class-weights', action='store_true',
                         help="Disable inverse-frequency class weights")
     parser.add_argument('--shap', action='store_true',
@@ -698,6 +923,8 @@ if __name__ == '__main__':
             tune_method=tune,
             corr_threshold=args.corr_threshold,
             drop_port=args.drop_port,
+            drop_env_features=args.drop_env_features,
+            hardened_hp=args.hardened_hp,
             use_class_weights=not args.no_class_weights,
             run_shap_flag=args.shap,
             save_plots=args.save_plots,

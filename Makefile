@@ -4,6 +4,9 @@ DATA     := data/merged
 IFACE    ?= eth0
 
 .PHONY: help all merge preprocess train train-rf train-tune train-ablation \
+        train-mixed train-cross-2017to2018 train-cross-2018to2017 \
+        train-cross-2017to2018-hardened train-cross-2018to2017-hardened \
+        train-fused-2018 train-fused-2017 \
         shap serve live-validate live-capture clean
 
 help:                                    ## Show this help
@@ -35,6 +38,43 @@ train-ablation:                          ## Train XGBoost without Destination Po
 	$(PYTHON) training/train_xgb.py \
 	  --drop-port --split-strategy per_file --save-plots \
 	  --model $(MODELS)/xgb_ids_model_no_port.pkl
+
+train-mixed:                             ## Train on 2017+2018 with mixed file-holdout split
+	$(PYTHON) training/train_xgb.py \
+	  --split-strategy mixed_holdout --save-plots \
+	  --model $(MODELS)/xgb_ids_mixed.pkl
+
+train-cross-2017to2018:                  ## Zero-shot: train on 2017, test on 2018
+	$(PYTHON) training/train_xgb.py \
+	  --split-strategy cross_dataset_2017to2018 --save-plots \
+	  --model $(MODELS)/xgb_ids_cross_2017to2018.pkl
+
+train-cross-2018to2017:                  ## Zero-shot: train on 2018, test on 2017
+	$(PYTHON) training/train_xgb.py \
+	  --split-strategy cross_dataset_2018to2017 --save-plots \
+	  --model $(MODELS)/xgb_ids_cross_2018to2017.pkl
+
+train-cross-2017to2018-hardened:         ## Zero-shot 2017→2018 + env drop + hardened HP
+	$(PYTHON) training/train_xgb.py \
+	  --split-strategy cross_dataset_2017to2018 \
+	  --drop-env-features --hardened-hp --save-plots \
+	  --model $(MODELS)/xgb_ids_cross_2017to2018_hardened.pkl
+
+train-cross-2018to2017-hardened:         ## Zero-shot 2018→2017 + env drop + hardened HP
+	$(PYTHON) training/train_xgb.py \
+	  --split-strategy cross_dataset_2018to2017 \
+	  --drop-env-features --hardened-hp --save-plots \
+	  --model $(MODELS)/xgb_ids_cross_2018to2017_hardened.pkl
+
+train-fused-2018:                        ## Fused: all 2017 + 80% 2018 → 20% 2018 holdout
+	$(PYTHON) training/train_xgb.py \
+	  --split-strategy fused_2018holdout --save-plots \
+	  --model $(MODELS)/xgb_ids_fused_2018holdout.pkl
+
+train-fused-2017:                        ## Fused: all 2018 + 80% 2017 → 20% 2017 holdout
+	$(PYTHON) training/train_xgb.py \
+	  --split-strategy fused_2017holdout --save-plots \
+	  --model $(MODELS)/xgb_ids_fused_2017holdout.pkl
 
 shap:                                    ## Train + SHAP interpretability
 	$(PYTHON) training/train_xgb.py \
